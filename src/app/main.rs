@@ -20,17 +20,18 @@ use logging;
 use metrics::FmtMetrics;
 use never::Never;
 use proxy::{
-    self, accept, buffer,
+    self, accept,
     http::{
         client, insert, metrics as http_metrics, normalize_uri, profiles, router, settings,
         strip_header,
     },
-    pending, reconnect,
+    reconnect,
 };
 use svc::{self, LayerExt};
 use tap;
 use task;
 use telemetry;
+use trace;
 use transport::{self, connect, keepalive, tls, Connection, GetOriginalDst, Listen};
 use {Addr, Conditional};
 
@@ -62,6 +63,7 @@ struct ProxyParts<G> {
     identity: tls::Conditional<(identity::Local, identity::CrtKeyStore)>,
 
     start_time: SystemTime,
+    trace_level: trace::LevelHandle,
 
     admin_listener: Listen<identity::Local, ()>,
     control_listener: Option<Listen<identity::Local, ()>>,
@@ -87,7 +89,12 @@ impl<G> Main<G>
 where
     G: GetOriginalDst + Clone + Send + 'static,
 {
-    pub fn new<R>(config: Config, get_original_dst: G, runtime: R) -> Self
+    pub fn new<R>(
+        config: Config,
+        trace_level: trace::LevelHandle,
+        get_original_dst: G,
+        runtime: R,
+    ) -> Self
     where
         R: Into<task::MainRuntime>,
     {
@@ -125,6 +132,7 @@ where
             config,
             identity,
             start_time,
+            trace_level,
             inbound_listener,
             outbound_listener,
             control_listener,
@@ -195,6 +203,7 @@ where
             config,
             identity,
             start_time,
+            trace_level,
             control_listener,
             inbound_listener,
             outbound_listener,
@@ -379,7 +388,7 @@ where
                     rt.spawn(control::serve_http(
                         "admin",
                         admin_listener,
-                        Admin::new(report, readiness),
+                        Admin::new(report, readiness, trace_level),
                     ));
 
                     if let Some(listener) = control_listener {
@@ -483,7 +492,6 @@ where
                 .layer(strip_header::response::layer(super::L5D_SERVER_ID))
                 .layer(strip_header::response::layer(super::L5D_REMOTE_IP))
                 .service(client_stack);
-
             // A per-`dst::Route` layer that uses profile data to configure
             // a per-route layer.
             //
@@ -515,26 +523,23 @@ where
                         ep
                     },
                 ))
-                .layer(buffer::layer(max_in_flight, DispatchDeadline::extract))
-                .into_inner();
+                .buffer_pending(max_in_flight, DispatchDeadline::extract);
 
             // Resolves the target via the control plane and balances requests
             // over all endpoints returned from the destination service.
             let balancer = svc::builder()
                 .layer(balance::layer(EWMA_DEFAULT_RTT, EWMA_DECAY))
                 .layer(resolve::layer(Resolve::new(resolver)))
-                .into_inner();
+                .spawn_ready();
 
             let distributor = svc::builder()
                 .layer(
                     // Attempt to build a balancer. If the service is
                     // unresolvable, fall back to using a router that dispatches
                     // request to the application-selected original destination.
-                    fallback::layer(balancer, orig_dst_router)
+                    fallback::layer(balancer.into_inner(), orig_dst_router.into_inner())
                         .on_error::<control::destination::Unresolvable>(),
                 )
-                .layer(pending::layer())
-                .layer(balance::weight::layer())
                 .service(endpoint_stack);
 
             // A per-`DstAddr` stack that does the following:
